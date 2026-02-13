@@ -1,0 +1,14 @@
+# Python Dependencies (Install via pip)
+torch
+torchvision
+numpy
+opencv-python
+pandas
+Pillow
+scikit-learn
+
+# C++/System Dependencies (Install via System Package Manager or Direct Download)
+NVIDIA CUDA Toolkit
+OpenCV (C++ Development Libraries, e.g., libopencv-dev)
+C++ Compiler (e.g., GCC, Clang)
+CMake

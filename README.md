@@ -20,14 +20,6 @@ This repository provides a modular C++/CUDA neural network framework for researc
 *   `optimizer`: Optimizer implementations (Adam, SGD, etc.)
 *   `debug` and `DebugUtils`: Debugging, logging, and inspection tools.
 
-## TODO:
-*  Improving memory access.
-*  Vectorization.
-*  Loop ordering/tiling.
-*  Precomputation.
-*  Reducing scheduler overhead.
-*  Code cleanup.
-
 ## How to Use
 ## IMPORTANT:
 Datasets must be placed inside a /Dataset folder in root dir.

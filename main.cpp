@@ -86,48 +86,48 @@ int main()
     std::string boston_csv_path = "Dataset/Boston.csv";
     std::string california_csv_path = "Dataset/housing.csv";
 
-    // std::cout << "\n--- Starting Boston Housing Regression ---\n";
-    // boston_regression::train_boston_regressor(
-    //     batch_size,
-    //     epochs,
-    //     boston_csv_path,
-    //     0.001f,
-    //     "mse" // Loss function: "mse" or "mae" or "huber"
-    // );
-    // cpu_boston_regression::train_boston_regressor(
-    //     batch_size,
-    //     epochs,
-    //     boston_csv_path,
-    //     0.001f,
-    //     "mse" // Loss function: "mse" or "mae" or "huber"
-    // );
-    // std::cout << "\n--- Finished Boston Housing Regression ---\n";
+    std::cout << "\n--- Starting Boston Housing Regression ---\n";
+    boston_regression::train_boston_regressor(
+        batch_size,
+        epochs,
+        boston_csv_path,
+        0.001f,
+        "mse" // Loss function: "mse" or "mae" or "huber"
+    );
+    cpu_boston_regression::train_boston_regressor(
+        batch_size,
+        epochs,
+        boston_csv_path,
+        0.001f,
+        "mse" // Loss function: "mse" or "mae" or "huber"
+    );
+    std::cout << "\n--- Finished Boston Housing Regression ---\n";
 
 
-    // //--- Run California Housing Regression ---
-    // std::cout << "\n--- Starting California Housing Regression ---\n";
-    // california_regression::train_california_regressor(
-    //     batch_size, // Can use a different batch size if desired
-    //     epochs,     // Can use different epochs
-    //     california_csv_path,
-    //     0.001f,    // Learning rate
-    //     "mse" // Loss function: "mse" or "mae" or "huber"
-    // );
+    //--- Run California Housing Regression ---
+    std::cout << "\n--- Starting California Housing Regression ---\n";
+    california_regression::train_california_regressor(
+        batch_size, // Can use a different batch size if desired
+        epochs,     // Can use different epochs
+        california_csv_path,
+        0.001f,    // Learning rate
+        "mse" // Loss function: "mse" or "mae" or "huber"
+    );
 
-    // cpu_california_regression::train_california_regressor(
-    //     batch_size, // Can use a different batch size if desired
-    //     epochs,     // Can use different epochs
-    //     california_csv_path,
-    //     0.001f,    // Learning rate
-    //     "mse" // Loss function: "mse" or "mae" or "huber"
-    // );
-    // std::cout << "\n--- Finished California Housing Regression ---\n";
+    cpu_california_regression::train_california_regressor(
+        batch_size, // Can use a different batch size if desired
+        epochs,     // Can use different epochs
+        california_csv_path,
+        0.001f,    // Learning rate
+        "mse" // Loss function: "mse" or "mae" or "huber"
+    );
+    std::cout << "\n--- Finished California Housing Regression ---\n";
 
     // // // Train the model
-    // cifar_train::train_cifar_classifier(batch_size, epochs, cifar_dataset_path, 32, 32, false);
+    cifar_train::train_cifar_classifier(batch_size, epochs, cifar_dataset_path, 32, 32, false);
     // // //cpu_cifar_train::train_cifar_classifier(batch_size, epochs, cifar_dataset_path, 32, 32, false);
 
-    //mnist_train::train_mnist_classifier(batch_size, epochs, mnist_dataset_path, image_height, image_width, use_grayscale);
+    mnist_train::train_mnist_classifier(batch_size, epochs, mnist_dataset_path, image_height, image_width, use_grayscale);
     // //cpu_mnist_train::train_mnist_classifier(batch_size, epochs, mnist_dataset_path, image_height, image_width, use_grayscale);
     
     conv::train_conv_model(batch_size, epochs, dataset_path, image_height, image_width, use_grayscale);
