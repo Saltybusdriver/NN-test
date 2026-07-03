@@ -1,0 +1,806 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <memory>
+#include <chrono>
+#include <iomanip>
+#include <numeric>
+#include <algorithm>
+#include <stdexcept>
+#include <cstdlib>
+
+
+#include "cifar_train.h"  
+#include "DataLoader.h"
+#include "CifarDataset.h" 
+#include "NeuralNetwork.h"
+#include "optimizer.h"
+#include "debug.h"   
+#include "utils.h"
+#include "layer_proxy.h"
+#include "cuda_functions.h"
+
+namespace cifar_train {
+
+int INPUT_WIDTH = 32;
+int INPUT_HEIGHT = 32;
+const int INPUT_CHANNELS = 3; 
+const int NUM_CLASSES = 10;
+const size_t INPUT_SIZE = INPUT_WIDTH * INPUT_HEIGHT * INPUT_CHANNELS;
+
+
+const float ADAM_BETA1 = 0.9f;
+const float ADAM_BETA2 = 0.999f;
+const float ADAM_EPSILON = 1e-8f;
+
+// float calculate_accuracy(const float* predictions, const float* targets, size_t batch_size, int num_classes) {
+//     int correct = 0;
+//     for (size_t i = 0; i < batch_size; ++i) {
+//         const float* current_pred = predictions + i * num_classes;
+//         const float* current_target = targets + i * num_classes;
+//         int pred_idx = std::distance(current_pred, std::max_element(current_pred, current_pred + num_classes));
+//         int target_idx = std::distance(current_target, std::max_element(current_target, current_target + num_classes));
+//         if (pred_idx == target_idx) {
+//             correct++;
+//         }
+//     }
+//     return (batch_size > 0) ? static_cast<float>(correct) / batch_size : 0.0f;
+// }
+
+void print_cifar_predictions(
+    const float* targets_host,
+    const float* outputs_host,
+    int num_samples_to_show,
+    int batch_size,
+    int num_classes)
+{
+    if (!targets_host || !outputs_host) {
+        std::cerr << "Warning: Cannot print predictions due to null host data pointers." << std::endl;
+        return;
+    }
+
+    num_samples_to_show = std::min(num_samples_to_show, batch_size);
+    std::cout << "\n--- Sample CIFAR-10 Predictions ---" << std::endl;
+    std::cout << "Sample | True Label | Predicted Label | Output Scores (Optional)" << std::endl;
+    std::cout << "----------------------------------------------------------------" << std::endl;
+    const char* class_names[10] = {"airplane", "automobile", "bird", "cat", "deer", "dog", "frog", "horse", "ship", "truck"};
+
+    for (int i = 0; i < num_samples_to_show; ++i) {
+        const float* current_target = targets_host + i * num_classes;
+        const float* current_output = outputs_host + i * num_classes;
+
+        int true_label_idx = std::distance(current_target, std::max_element(current_target, current_target + num_classes));
+        int predicted_label_idx = std::distance(current_output, std::max_element(current_output, current_output + num_classes));
+
+        std::cout << std::setw(6) << i << " | "
+                  << std::setw(10) << class_names[true_label_idx] << " | " // Use class names
+                  << std::setw(15) << class_names[predicted_label_idx] << " | "; // Use class names
+
+        std::cout << "[";
+        for(int j=0; j<num_classes; ++j) {
+            std::cout << std::fixed << std::setprecision(2) << current_output[j] << (j == num_classes - 1 ? "" : ", ");
+        }
+        std::cout << "]" << std::endl;
+    }
+    std::cout << "----------------------------------------------------------------" << std::endl;
+}
+
+
+
+void train_cifar_classifier(
+    int batch_size, int num_epochs,
+    const std::string& dataset_path,
+    int image_height, int image_width,
+    bool use_grayscale)
+{
+
+    if (use_grayscale) 
+    {
+        std::cerr << "Warning: CIFAR-10 is a color dataset. 'use_grayscale' is forced to false." << std::endl;
+    }
+    if (image_height != INPUT_HEIGHT || image_width != INPUT_WIDTH) 
+    {
+         std::cerr << "Warning: Image dimensions should be " << INPUT_HEIGHT << "x" << INPUT_WIDTH
+                   << " for CIFAR-10. Using constants." << std::endl;
+         image_height = INPUT_HEIGHT;
+         image_width = INPUT_WIDTH;
+    }
+    use_grayscale = false;
+
+    bool use_cuda =true; 
+    SetUseCuda(use_cuda);
+    // Per-batch CUDA timings are useful when profiling one loop section, but
+    // they are expensive as hell in normal training: cudaEventSynchronize turns
+    // async CUDA launches into "hold up, wait for me" simulator 2016. Keep this
+    // off by default so batches can queue normally; set NNLIB_CUDA_BATCH_TIMINGS=1
+    // when you intentionally want fwd/loss/bwd/update timings.
+    
+    const char* batch_timing_env = std::getenv("NNLIB_CUDA_BATCH_TIMINGS");
+    const bool collect_batch_cuda_timings = batch_timing_env && batch_timing_env[0] == '1';
+    int epochs = num_epochs;
+    float learning_rate = 0.001f;
+
+    std::cout << "\n=== CIFAR-10 Classifier Training ===\n";
+    std::cout << "Using CUDA: " << (use_cuda ? "Yes" : "No") << std::endl;
+    std::cout << "Epochs: " << epochs << ", Batch Size: " << batch_size
+              << ", Learning Rate: " << learning_rate << std::endl;
+    std::cout << "Dataset Path: " << dataset_path << std::endl;
+
+    cudaEvent_t cuda_start = nullptr, cuda_stop = nullptr, cuda_test_start = nullptr, cuda_test_stop = nullptr;
+    cudaEvent_t batch_fwd_start = nullptr, batch_fwd_stop = nullptr;
+    cudaEvent_t batch_loss_start = nullptr, batch_loss_stop = nullptr;
+    cudaEvent_t batch_bwd_start = nullptr, batch_bwd_stop = nullptr;
+    cudaEvent_t batch_update_start = nullptr, batch_update_stop = nullptr;
+    cudaEvent_t epoch_start_event, epoch_stop_event;
+
+    if (use_cuda) 
+    {
+        cudaEventCreate(&cuda_start);
+        cudaEventCreate(&cuda_stop);
+        cudaEventCreate(&cuda_test_start);
+        cudaEventCreate(&cuda_test_stop);
+        if (collect_batch_cuda_timings) {
+            cudaEventCreate(&batch_fwd_start);
+            cudaEventCreate(&batch_fwd_stop);
+            cudaEventCreate(&batch_loss_start);
+            cudaEventCreate(&batch_loss_stop);
+            cudaEventCreate(&batch_bwd_start);
+            cudaEventCreate(&batch_bwd_stop);
+            cudaEventCreate(&batch_update_start);
+            cudaEventCreate(&batch_update_stop);
+        }
+        cudaEventCreate(&epoch_start_event);
+        cudaEventCreate(&epoch_stop_event);
+    }
+    auto program_start = std::chrono::high_resolution_clock::now();
+
+    std::cout << "Loading datasets..." << std::endl;
+    auto dataset_load_start = std::chrono::high_resolution_clock::now(); 
+
+    std::shared_ptr<CifarDataset> train_dataset; 
+    std::shared_ptr<CifarDataset> val_dataset;   
+    std::shared_ptr<CifarDataset> test_dataset;  
+    try {
+        train_dataset = std::make_shared<CifarDataset>(dataset_path, "training");
+        
+        val_dataset = std::make_shared<CifarDataset>(dataset_path, "testing"); 
+        test_dataset = std::make_shared<CifarDataset>(dataset_path, "testing");
+        auto dataset_load_end = std::chrono::high_resolution_clock::now(); 
+        auto dataset_load_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(dataset_load_end - dataset_load_start); 
+
+        std::cout << "Datasets loaded successfully in " << dataset_load_duration_ms.count() << " ms." << std::endl;
+        std::cout << "Training set size: " << train_dataset->size() << std::endl;
+        std::cout << "Validation set size: " << val_dataset->size() << std::endl;
+        std::cout << "Test set size: " << test_dataset->size() << std::endl;
+
+        if (train_dataset->size() == 0 || test_dataset->size() == 0) 
+        {
+             throw std::runtime_error("One or more CIFAR-10 datasets are empty. Check path and data format.");
+        }
+
+    } 
+    catch (const std::exception& e) 
+    {
+        std::cerr << "Error loading CIFAR-10 datasets: " << e.what() << std::endl;
+        return;
+    }
+
+    DataLoader train_loader(train_dataset, batch_size, true, 12); 
+    DataLoader val_loader(val_dataset, batch_size, false, 4);  
+    DataLoader test_loader(test_dataset, batch_size, false, 4);
+
+    NeuralNetwork network(batch_size);
+
+
+    try {
+        
+        // network.add_layer(Conv2d(INPUT_CHANNELS, 32, INPUT_HEIGHT, INPUT_WIDTH, 3, 1, 1, batch_size, "relu"));
+        // network.add_layer(Conv2d(32, 32, 32, 32, 3, 1, 1, batch_size, "relu")); 
+        // network.add_layer(Flatten(batch_size, 32, 32, 32)); 
+        // int flattened_size = 32 * 32 * 32; 
+        // network.add_layer(Linear(flattened_size, 32, batch_size, "relu")); 
+        // network.add_layer(Linear(32, NUM_CLASSES, batch_size, "none")); 
+
+        network.add_layer(Conv2d(INPUT_CHANNELS, 32, INPUT_HEIGHT, INPUT_WIDTH, 3, 1, 1, batch_size, "relu"));
+        network.add_layer(Conv2d(32, 64, INPUT_HEIGHT, INPUT_WIDTH, 3, 1, 1, batch_size, "relu"));
+        network.add_layer(Flatten(batch_size, 64, INPUT_HEIGHT, INPUT_WIDTH));
+        int flattened_size = 64 * INPUT_HEIGHT * INPUT_WIDTH;
+        network.add_layer(Linear(flattened_size, 128, batch_size, "relu"));
+        network.add_layer(Linear(128, NUM_CLASSES, batch_size, "none"));
+        if (network.layers.empty()) 
+        {
+             throw std::runtime_error("Network definition is empty.");
+        }
+    } 
+    catch (const std::exception& e) 
+    {
+         std::cerr << "Error building network: " << e.what() << std::endl;
+         if (use_cuda) 
+         {
+             if(cuda_start) cudaEventDestroy(cuda_start);
+             if(cuda_stop) cudaEventDestroy(cuda_stop);
+             if(cuda_test_start) cudaEventDestroy(cuda_test_start);
+             if(cuda_test_stop) cudaEventDestroy(cuda_test_stop);
+         }
+         return;
+    }
+
+    std::unique_ptr<OptimizerBase> optimizer = create_optimizer("adam", learning_rate, ADAM_BETA1, ADAM_BETA2, ADAM_EPSILON);
+    std::cout << "Using Adam Optimizer (LR=" << learning_rate << ")" << std::endl;
+
+    const char* loss_type = "bce";
+    std::cout << "Using Loss: " << loss_type << std::endl;
+
+    float* d_element_loss = nullptr;
+    float* d_epoch_loss_sum = nullptr;
+    int* d_epoch_correct_count = nullptr;
+    size_t max_output_elements = batch_size * NUM_CLASSES;
+    std::vector<float> h_element_loss(max_output_elements);
+
+    if (use_cuda) 
+    {
+        safeCudaMalloc(&d_element_loss, max_output_elements * sizeof(float), "d_element_loss (CIFAR)");
+        safeCudaMalloc(&d_epoch_loss_sum, sizeof(float), "d_epoch_loss_sum (CIFAR)");
+        CUDA_CHECK_ERROR(cudaMalloc(&d_epoch_correct_count, sizeof(int)));
+        CUDA_CHECK_ERROR(cudaMemset(d_epoch_correct_count, 0, sizeof(int)));
+    } 
+    else 
+    {
+        d_element_loss = h_element_loss.data();
+    }
+
+    std::cout << "Starting training..." << std::endl;
+    std::cout << std::fixed << std::setprecision(6);
+
+    if (use_cuda) cudaEventRecord(cuda_start);
+    auto train_start_overall_chrono = std::chrono::high_resolution_clock::now(); 
+
+    size_t total_train_batches_processed = 0; 
+    std::vector<double> epoch_times_s;        
+
+    double total_data_load_s = 0.0;
+    double total_forward_s = 0.0;
+    double total_loss_gpu_s = 0.0;
+    double total_loss_host_s = 0.0;
+    double total_backward_s = 0.0;
+    double total_update_s = 0.0;
+    double total_acc_calc_s = 0.0;
+    
+    std::shared_ptr<Batch> batch;
+    for (int epoch = 0; epoch < epochs; ++epoch) 
+    {
+        auto epoch_start_chrono = std::chrono::high_resolution_clock::now();
+        if (use_cuda) cudaEventRecord(epoch_start_event);
+
+        float epoch_loss = 0.0f;
+        float epoch_accuracy = 0.0f;
+        size_t batches_processed_this_epoch = 0;
+        size_t samples_processed_this_epoch = 0;
+        train_loader.reset();
+        if (use_cuda) {
+            CUDA_CHECK_ERROR(cudaMemset(d_epoch_loss_sum, 0, sizeof(float)));
+            CUDA_CHECK_ERROR(cudaMemset(d_epoch_correct_count, 0, sizeof(int)));
+        }
+
+        double epoch_data_load_s = 0.0;
+        double epoch_forward_s = 0.0;
+        double epoch_loss_gpu_s = 0.0;
+        double epoch_loss_host_s = 0.0;
+        double epoch_backward_s = 0.0;
+        double epoch_update_s = 0.0;
+        double epoch_acc_calc_s = 0.0;
+
+        float batch_fwd_time_ms = 0.0f;
+        float batch_loss_gpu_time_ms = 0.0f;
+        float batch_bwd_time_ms = 0.0f;
+        float batch_update_time_ms = 0.0f;
+
+        std::cout << "\n--- Epoch " << (epoch + 1) << "/" << epochs << " ---" << std::endl;
+
+        while ((batch = train_loader.next_batch()) != nullptr)
+        {
+
+            auto dload_start = std::chrono::high_resolution_clock::now();
+            if (!batch || batch->batch_size == 0) continue;
+            auto dload_end = std::chrono::high_resolution_clock::now();
+            epoch_data_load_s += std::chrono::duration<double>(dload_end - dload_start).count();
+
+            float* inputs = use_cuda ? batch->d_inputs : batch->inputs_flattened.data();
+            float* targets = use_cuda ? batch->d_targets : batch->targets_flattened.data();
+            size_t current_batch_size = batch->batch_size;
+
+            if (!inputs || !targets) 
+            {
+                 std::cerr << "Warning: Skipping batch with null data pointers." << std::endl;
+                 continue;
+            }
+
+            // --- Time Forward Pass ---
+            if (use_cuda && collect_batch_cuda_timings) cudaEventRecord(batch_fwd_start);
+            auto fwd_chrono_start = std::chrono::high_resolution_clock::now();
+            network.forward(inputs, current_batch_size, use_cuda);
+            auto fwd_chrono_end = std::chrono::high_resolution_clock::now();
+            if (use_cuda && collect_batch_cuda_timings) cudaEventRecord(batch_fwd_stop);
+            else epoch_forward_s += std::chrono::duration<double>(fwd_chrono_end - fwd_chrono_start).count();
+            // --- End Forward Pass Time ---
+
+            float* outputs = network.layers.back()->output;
+            if (!outputs) {
+                 std::cerr << "Warning: Skipping batch due to null network output." << std::endl;
+                 continue;
+            }
+
+            size_t current_output_elements = current_batch_size * NUM_CLASSES;
+            float* current_loss_buffer_ptr = use_cuda ? d_element_loss : h_element_loss.data();
+
+            // --- Time Loss Computation (GPU/CPU) ---
+            if (use_cuda && collect_batch_cuda_timings) cudaEventRecord(batch_loss_start);
+            auto loss_comp_chrono_start = std::chrono::high_resolution_clock::now();
+            network.compute_loss(outputs, targets, current_loss_buffer_ptr, current_output_elements, loss_type);
+            auto loss_comp_chrono_end = std::chrono::high_resolution_clock::now();
+            if (use_cuda && collect_batch_cuda_timings) cudaEventRecord(batch_loss_stop);
+            else epoch_loss_gpu_s += std::chrono::duration<double>(loss_comp_chrono_end - loss_comp_chrono_start).count();
+            // --- End Loss Computation Time ---
+
+            // --- Time Loss Summation (Host) ---
+            float batch_loss_sum = 0.0f;
+            auto loss_sum_start = std::chrono::high_resolution_clock::now();
+            if (use_cuda)
+            {
+                cudafunc::accumulate_loss_sum_cuda(
+                    d_element_loss,
+                    d_epoch_loss_sum,
+                    nullptr,
+                    current_output_elements
+                );
+            }
+            else
+            {
+                batch_loss_sum = std::accumulate(h_element_loss.begin(), h_element_loss.begin() + current_output_elements, 0.0f);
+            }
+            auto loss_sum_end = std::chrono::high_resolution_clock::now();
+            epoch_loss_host_s += std::chrono::duration<double>(loss_sum_end - loss_sum_start).count();
+            // --- End Loss Summation Time ---
+
+            float batch_avg_loss = (current_batch_size > 0) ? (batch_loss_sum / current_batch_size) : 0.0f;
+
+            // --- Time Backward Pass ---
+            if (use_cuda && collect_batch_cuda_timings) cudaEventRecord(batch_bwd_start);
+            auto bwd_chrono_start = std::chrono::high_resolution_clock::now();
+            network.backward(targets, 0.0f, loss_type);
+            auto bwd_chrono_end = std::chrono::high_resolution_clock::now();
+            if (use_cuda && collect_batch_cuda_timings) cudaEventRecord(batch_bwd_stop);
+            else epoch_backward_s += std::chrono::duration<double>(bwd_chrono_end - bwd_chrono_start).count();
+            // --- End Backward Pass Time ---
+
+            // --- Time Optimizer Update ---
+            if (use_cuda && collect_batch_cuda_timings) cudaEventRecord(batch_update_start);
+            auto update_chrono_start = std::chrono::high_resolution_clock::now();
+            for (auto& layer : network.layers) 
+            {
+                layer->update_params(*optimizer);
+            }
+            auto update_chrono_end = std::chrono::high_resolution_clock::now();
+            if (use_cuda && collect_batch_cuda_timings) cudaEventRecord(batch_update_stop);
+            else epoch_update_s += std::chrono::duration<double>(update_chrono_end - update_chrono_start).count();
+            // --- End Optimizer Update Time ---
+
+            // --- Time Accuracy Calculation ---
+            float accuracy = 0.0f;
+            auto acc_calc_start = std::chrono::high_resolution_clock::now();
+            if (use_cuda) 
+            {
+                 cudafunc::accumulate_correct_count_cuda(
+                     outputs,
+                     targets,
+                     d_epoch_correct_count,
+                     nullptr,
+                     current_batch_size,
+                     NUM_CLASSES
+                 );
+            } 
+            else 
+            {
+                 accuracy = calculate_accuracy(outputs, targets, current_batch_size, NUM_CLASSES);
+            }
+            auto acc_calc_end = std::chrono::high_resolution_clock::now();
+            epoch_acc_calc_s += std::chrono::duration<double>(acc_calc_end - acc_calc_start).count();
+            // --- End Accuracy Calculation Time ---
+
+            // --- Synchronize and Accumulate GPU Timings ---
+            // This block is intentionally opt-in. Each cudaEventSynchronize waits
+            // for all prior GPU work in that region to finish, so enabling it gives
+            // more accurate section timings but also serializes the batch loop. In
+            // Nsight this shows up as giant host waits even when the kernels are
+            // already fast. Translation: useful microscope, cursed training mode.
+            if (use_cuda && collect_batch_cuda_timings) 
+            {
+                cudaEventSynchronize(batch_fwd_stop);
+                cudaEventElapsedTime(&batch_fwd_time_ms, batch_fwd_start, batch_fwd_stop);
+                epoch_forward_s += batch_fwd_time_ms / 1000.0;
+
+                cudaEventSynchronize(batch_loss_stop);
+                cudaEventElapsedTime(&batch_loss_gpu_time_ms, batch_loss_start, batch_loss_stop);
+                epoch_loss_gpu_s += batch_loss_gpu_time_ms / 1000.0;
+
+                cudaEventSynchronize(batch_bwd_stop);
+                cudaEventElapsedTime(&batch_bwd_time_ms, batch_bwd_start, batch_bwd_stop);
+                epoch_backward_s += batch_bwd_time_ms / 1000.0;
+
+                cudaEventSynchronize(batch_update_stop);
+                cudaEventElapsedTime(&batch_update_time_ms, batch_update_start, batch_update_stop);
+                epoch_update_s += batch_update_time_ms / 1000.0;
+            }
+            // --- End Accumulate GPU Timings ---
+
+            if (!use_cuda) {
+                epoch_loss += batch_avg_loss;
+                epoch_accuracy += accuracy;
+            }
+            batches_processed_this_epoch++;
+            total_train_batches_processed++;
+            samples_processed_this_epoch += current_batch_size;
+
+            if (batches_processed_this_epoch % 10 == 0 || batches_processed_this_epoch == 1) 
+            {
+                 float display_loss = batch_avg_loss;
+                 float display_accuracy = accuracy;
+                 // Do not read CUDA loss/accuracy here. A 4-byte device-to-host
+                 // cudaMemcpy is still a full stream sync when the value depends on
+                 // queued kernels, and report48 showed those tiny readbacks stalling
+                 // for ~175 ms each. Epoch metrics are copied once after the epoch
+                 // where the synchronization is actually needed.
+                 if (use_cuda) {
+                     std::cout << "  Batch " << std::setw(4) << batches_processed_this_epoch << "/" << train_loader.get_num_batches()
+                               << "\r" << std::flush;
+                 } else {
+                     std::cout << "  Batch " << std::setw(4) << batches_processed_this_epoch << "/" << train_loader.get_num_batches()
+                               << " Loss: " << display_loss
+                               << " Acc: "  << display_accuracy << "\r" << std::flush;
+                 }
+            }
+            //train_loader.return_batch(batch);
+        } 
+        std::cout << std::endl;
+
+        float avg_epoch_loss = 0.0f;
+        float avg_epoch_acc = 0.0f;
+        if (batches_processed_this_epoch > 0) 
+        {
+            if (use_cuda) {
+                float h_epoch_loss_sum = 0.0f;
+                int h_epoch_correct_count = 0;
+                CUDA_CHECK_ERROR(cudaMemcpy(&h_epoch_loss_sum, d_epoch_loss_sum, sizeof(float), cudaMemcpyDeviceToHost));
+                CUDA_CHECK_ERROR(cudaMemcpy(&h_epoch_correct_count, d_epoch_correct_count, sizeof(int), cudaMemcpyDeviceToHost));
+                avg_epoch_loss = (samples_processed_this_epoch > 0)
+                    ? h_epoch_loss_sum / static_cast<float>(samples_processed_this_epoch)
+                    : 0.0f;
+                avg_epoch_acc = (samples_processed_this_epoch > 0)
+                    ? static_cast<float>(h_epoch_correct_count) / static_cast<float>(samples_processed_this_epoch)
+                    : 0.0f;
+            } else {
+                avg_epoch_loss = epoch_loss / batches_processed_this_epoch;
+                avg_epoch_acc = epoch_accuracy / batches_processed_this_epoch;
+            }
+            std::cout << "  Train Loss: " << avg_epoch_loss
+                      << ", Train Accuracy: " << avg_epoch_acc << std::endl;
+        } 
+        else 
+        {
+            std::cout << "  No training batches processed this epoch." << std::endl;
+        }
+
+        auto epoch_end_chrono = std::chrono::high_resolution_clock::now();
+        double epoch_duration_s_cpu = std::chrono::duration<double>(epoch_end_chrono - epoch_start_chrono).count();
+        float gpu_epoch_time_ms = 0;
+        if (use_cuda) 
+        {
+            cudaEventRecord(epoch_stop_event);
+            cudaEventSynchronize(epoch_stop_event);
+            cudaEventElapsedTime(&gpu_epoch_time_ms, epoch_start_event, epoch_stop_event);
+            epoch_times_s.push_back(gpu_epoch_time_ms / 1000.0);
+        } 
+        else 
+        {
+            epoch_times_s.push_back(epoch_duration_s_cpu);
+        }
+        std::cout << "  Epoch Time: " << epoch_times_s.back() << " s" << std::endl;
+
+        if (batches_processed_this_epoch > 0 && (!use_cuda || collect_batch_cuda_timings)) 
+        {
+            std::cout << "  Avg Batch Timings (ms): "
+                      << "Load: " << (epoch_data_load_s * 1000.0 / batches_processed_this_epoch)
+                      << " | Fwd: "  << (epoch_forward_s * 1000.0 / batches_processed_this_epoch)
+                      << " | LossGPU: " << (epoch_loss_gpu_s * 1000.0 / batches_processed_this_epoch)
+                      << " | LossHost: "  << (epoch_loss_host_s * 1000.0 / batches_processed_this_epoch)
+                      << " | Bwd: "  << (epoch_backward_s * 1000.0 / batches_processed_this_epoch)
+                      << " | Update: "  << (epoch_update_s * 1000.0 / batches_processed_this_epoch)
+                      << " | AccCalc: " << (epoch_acc_calc_s * 1000.0 / batches_processed_this_epoch)
+                      << std::endl;
+        }
+
+        total_data_load_s += epoch_data_load_s;
+        total_forward_s += epoch_forward_s;
+        total_loss_gpu_s += epoch_loss_gpu_s;
+        total_loss_host_s += epoch_loss_host_s;
+        total_backward_s += epoch_backward_s;
+        total_update_s += epoch_update_s;
+        total_acc_calc_s += epoch_acc_calc_s;
+
+    }
+
+    float gpu_train_time = 0;
+    if (use_cuda) 
+    {
+        cudaEventRecord(cuda_stop);
+        cudaEventSynchronize(cuda_stop);
+        cudaEventElapsedTime(&gpu_train_time, cuda_start, cuda_stop);
+        std::cout << "\nTraining complete! Total GPU Training Time: " << gpu_train_time << " ms\n";
+    } 
+    else 
+    {
+         std::cout << "\nTraining complete! (CPU Mode)\n";
+    }
+
+    // --- Testing Phase ---
+    std::cout << "\n--- Testing ---" << std::endl;
+    if (use_cuda) cudaEventRecord(cuda_test_start);
+
+    float test_loss = 0.0f;
+    float test_accuracy = 0.0f;
+    size_t test_batches = 0;
+    float final_test_loss = 0.0f;
+    float final_test_acc = 0.0f;
+    size_t test_samples = 0;
+    test_loader.reset();
+    if (use_cuda) {
+        CUDA_CHECK_ERROR(cudaMemset(d_epoch_loss_sum, 0, sizeof(float)));
+        CUDA_CHECK_ERROR(cudaMemset(d_epoch_correct_count, 0, sizeof(int)));
+    }
+
+    while ((batch = test_loader.next_batch()) != nullptr) 
+    {
+         if (!batch || batch->batch_size == 0) continue;
+         float* inputs = use_cuda ? batch->d_inputs : batch->inputs_flattened.data();
+         float* targets = use_cuda ? batch->d_targets : batch->targets_flattened.data();
+         size_t current_batch_size = batch->batch_size;
+         if (!inputs || !targets) continue;
+
+         network.forward(inputs, current_batch_size, use_cuda);
+         float* outputs = network.layers.back()->output;
+         if (!outputs) continue;
+
+         size_t current_output_elements = current_batch_size * NUM_CLASSES;
+         float* current_d_element_loss_ptr = use_cuda ? d_element_loss : h_element_loss.data();
+         network.compute_loss(outputs, targets, current_d_element_loss_ptr, current_output_elements, loss_type);
+
+         float batch_loss_sum = 0.0f;
+         if (use_cuda) 
+         {
+             cudafunc::accumulate_loss_sum_cuda(
+                 d_element_loss,
+                 d_epoch_loss_sum,
+                 nullptr,
+                 current_output_elements
+             );
+         }
+         else
+         {
+             batch_loss_sum = std::accumulate(h_element_loss.begin(), h_element_loss.begin() + current_output_elements, 0.0f);
+         }
+         float batch_avg_loss = (current_batch_size > 0) ? (batch_loss_sum / current_batch_size) : 0.0f;
+         if (!use_cuda) {
+             test_loss += batch_avg_loss;
+         }
+
+         float accuracy = 0.0f;
+         if (use_cuda) 
+         {
+             cudafunc::accumulate_correct_count_cuda(
+                 outputs,
+                 targets,
+                 d_epoch_correct_count,
+                 nullptr,
+                 current_batch_size,
+                 NUM_CLASSES
+             );
+         } 
+         else 
+         {
+             accuracy = calculate_accuracy(outputs, targets, current_batch_size, NUM_CLASSES);
+         }
+         if (!use_cuda) {
+             test_accuracy += accuracy;
+         }
+         test_samples += current_batch_size;
+         test_batches++;
+    }
+
+    float gpu_test_time = 0;
+    if (use_cuda) 
+    {
+        cudaEventRecord(cuda_test_stop);
+        cudaEventSynchronize(cuda_test_stop);
+        cudaEventElapsedTime(&gpu_test_time, cuda_test_start, cuda_test_stop); // Time in ms
+    }
+
+    if (test_batches > 0) 
+    {
+        if (use_cuda) {
+            float h_test_loss_sum = 0.0f;
+            int h_test_correct_count = 0;
+            CUDA_CHECK_ERROR(cudaMemcpy(&h_test_loss_sum, d_epoch_loss_sum, sizeof(float), cudaMemcpyDeviceToHost));
+            CUDA_CHECK_ERROR(cudaMemcpy(&h_test_correct_count, d_epoch_correct_count, sizeof(int), cudaMemcpyDeviceToHost));
+            final_test_loss = (test_samples > 0) ? h_test_loss_sum / static_cast<float>(test_samples) : 0.0f;
+            final_test_acc = (test_samples > 0) ? static_cast<float>(h_test_correct_count) / static_cast<float>(test_samples) : 0.0f;
+        } else {
+            final_test_loss = test_loss / test_batches;
+            final_test_acc = test_accuracy / test_batches;
+        }
+        std::cout << "Final Test Loss: "  << final_test_loss
+                  << ", Final Test Accuracy: "<< final_test_acc << std::endl;
+    } 
+    else 
+    {
+        std::cout << "No test batches were processed." << std::endl;
+    }
+    if (use_cuda) 
+    {
+        std::cout << "GPU Testing Time: " << gpu_test_time << " ms\n";
+    } 
+    else 
+    {
+        std::cout << "(CPU Mode Testing)\n";
+    }
+
+    
+    std::cout << "\n--- Generating Samples for Prediction Output ---" << std::endl;
+    test_loader.reset();
+    std::shared_ptr<Batch> sample_batch = test_loader.next_batch();
+
+    if (sample_batch && sample_batch->batch_size > 0) 
+    {
+        size_t sample_batch_size = sample_batch->batch_size;
+        size_t sample_output_elements = sample_batch_size * NUM_CLASSES;
+
+        std::vector<float> h_sample_targets(sample_output_elements);
+        std::vector<float> h_sample_outputs(sample_output_elements);
+
+        network.forward(use_cuda ? sample_batch->d_inputs : sample_batch->inputs_flattened.data(),
+                        sample_batch_size, use_cuda);
+        const float* d_sample_outputs = network.layers.back()->output;
+
+        if (d_sample_outputs) 
+        {
+            if (use_cuda) 
+            {
+                CUDA_CHECK_ERROR(cudaMemcpy(h_sample_targets.data(), sample_batch->d_targets, sample_output_elements * sizeof(float), cudaMemcpyDeviceToHost));
+                CUDA_CHECK_ERROR(cudaMemcpy(h_sample_outputs.data(), d_sample_outputs, sample_output_elements * sizeof(float), cudaMemcpyDeviceToHost));
+            } 
+            else 
+            {
+                memcpy(h_sample_targets.data(), sample_batch->targets_flattened.data(), sample_output_elements * sizeof(float));
+                memcpy(h_sample_outputs.data(), d_sample_outputs, sample_output_elements * sizeof(float)); // d_sample_outputs points to host data in CPU 
+            }
+
+            print_cifar_predictions(
+                h_sample_targets.data(),
+                h_sample_outputs.data(),
+                std::min((int)sample_batch_size, 5),
+                sample_batch_size,
+                NUM_CLASSES
+            );
+        } 
+        else 
+        {
+            std::cerr << "Could not generate sample outputs (forward pass failed?)." << std::endl;
+        }
+    } 
+    else 
+    {
+        std::cout << "Could not get a sample batch for prediction output." << std::endl;
+    }
+
+    // --- Calculate Additional Metrics ---
+    // Use the tracked total_train_batches_processed and epoch_times_s
+    float avg_latency_ms = (total_train_batches_processed > 0 && gpu_train_time > 0) ? (gpu_train_time / total_train_batches_processed) : 0.0f;
+    float throughput_samples_s = (gpu_train_time > 0) ? (static_cast<float>(train_dataset->size() * num_epochs) / (gpu_train_time / 1000.0f)) : 0.0f;
+    float avg_epoch_time_s = !epoch_times_s.empty() ? (std::accumulate(epoch_times_s.begin(), epoch_times_s.end(), 0.0f) / epoch_times_s.size()) : 0.0f;
+
+    float peak_cpu_mem = get_peak_cpu_memory_mb();
+    float current_gpu_mem = get_current_gpu_memory_usage_mb(use_cuda);
+
+    std::cout << "\n--- Final Summary ---" << std::endl;
+    if (test_batches > 0) 
+    {
+        std::cout << "Test Loss:               "  << final_test_loss << std::endl;
+        std::cout << "Test Accuracy:           " << final_test_acc << std::endl;
+    } 
+    else 
+    {
+        std::cout << "Test Loss:               N/A (No test batches)" << std::endl;
+        std::cout << "Test Accuracy:           N/A (No test batches)" << std::endl;
+    }
+    std::cout << "--- Performance Metrics ---" << std::endl;
+    if (use_cuda) 
+    {
+        std::cout << "Total GPU Train Time (ms): " << gpu_train_time << std::endl;
+        std::cout << "Total GPU Test Time (ms):  "  << gpu_test_time << std::endl;
+    } 
+    else 
+    {
+        float total_cpu_train_time_s = !epoch_times_s.empty() ? std::accumulate(epoch_times_s.begin(), epoch_times_s.end(), 0.0f) : 0.0f;
+        std::cout << "Total CPU Train Time (s):  "  << total_cpu_train_time_s << std::endl;
+        std::cout << "Total CPU Test Time (ms):  N/A (Not measured separately)" << std::endl;
+        avg_latency_ms = (total_train_batches_processed > 0 && total_cpu_train_time_s > 0) ? ((total_cpu_train_time_s * 1000.0f) / total_train_batches_processed) : 0.0f;
+        throughput_samples_s = (total_cpu_train_time_s > 0) ? (static_cast<float>(train_dataset->size() * num_epochs) / total_cpu_train_time_s) : 0.0f;
+    }
+    std::cout << "Avg. Latency/Batch (ms): "  << avg_latency_ms << std::endl;
+    std::cout << "Throughput (Samples/sec):"  << throughput_samples_s << std::endl;
+    std::cout << "Avg. Time per Epoch (s): "  << avg_epoch_time_s << std::endl;
+    if (peak_cpu_mem >= 0) 
+    {
+        std::cout << "Peak CPU Memory (MB):    "  << peak_cpu_mem << " (Linux VmHWM)" << std::endl;
+    } 
+    else 
+    {
+        std::cout << "Peak CPU Memory (MB):    N/A (Couldn't read /proc/self/status or not Linux)" << std::endl;
+    }
+    if (current_gpu_mem >= 0) 
+    {
+        std::cout << "Current GPU Memory (MB): " << current_gpu_mem << " (Used at end)" << std::endl;
+    } 
+    else 
+    {
+        std::cout << "Current GPU Memory (MB): N/A (CUDA error or not using CUDA)" << std::endl;
+    }
+    if (total_train_batches_processed > 0 && (!use_cuda || collect_batch_cuda_timings)) 
+    {
+        std::cout << "--- Avg Batch Breakdown (ms) ---" << std::endl;
+        std::cout << "  Data Load: "  << (total_data_load_s * 1000.0 / total_train_batches_processed) << std::endl;
+        std::cout << "  Forward:   "  << (total_forward_s * 1000.0 / total_train_batches_processed) << std::endl;
+        std::cout << "  Loss GPU:  "  << (total_loss_gpu_s * 1000.0 / total_train_batches_processed) << std::endl;
+        std::cout << "  Loss Host: "  << (total_loss_host_s * 1000.0 / total_train_batches_processed) << std::endl;
+        std::cout << "  Backward:  "  << (total_backward_s * 1000.0 / total_train_batches_processed) << std::endl;
+        std::cout << "  Update:    "  << (total_update_s * 1000.0 / total_train_batches_processed) << std::endl;
+        std::cout << "  Acc Calc:  "  << (total_acc_calc_s * 1000.0 / total_train_batches_processed) << std::endl;
+    }
+
+    std::cout << "\nCleaning up CIFAR-10 resources...\n";
+    if (use_cuda) 
+    {
+        safeCudaFree(&d_element_loss, "d_element_loss (CIFAR)");
+        safeCudaFree(&d_epoch_loss_sum, "d_epoch_loss_sum (CIFAR)");
+        if (d_epoch_correct_count) {
+            CUDA_CHECK_ERROR(cudaFree(d_epoch_correct_count));
+            d_epoch_correct_count = nullptr;
+        }
+        if (batch_fwd_start) cudaEventDestroy(batch_fwd_start);
+        if (batch_fwd_stop) cudaEventDestroy(batch_fwd_stop);
+        if (batch_loss_start) cudaEventDestroy(batch_loss_start);
+        if (batch_loss_stop) cudaEventDestroy(batch_loss_stop);
+        if (batch_bwd_start) cudaEventDestroy(batch_bwd_start);
+        if (batch_bwd_stop) cudaEventDestroy(batch_bwd_stop);
+        if (batch_update_start) cudaEventDestroy(batch_update_start);
+        if (batch_update_stop) cudaEventDestroy(batch_update_stop);
+        cudaEventDestroy(epoch_start_event);
+        cudaEventDestroy(epoch_stop_event);
+        if(cuda_start) cudaEventDestroy(cuda_start);
+        if(cuda_stop) cudaEventDestroy(cuda_stop);
+        if(cuda_test_start) cudaEventDestroy(cuda_test_start);
+        if(cuda_test_stop) cudaEventDestroy(cuda_test_stop);
+    }
+
+    for (auto& layer : network.layers) 
+    {
+        delete layer; 
+    }
+    network.layers.clear();
+
+    auto program_end = std::chrono::high_resolution_clock::now();
+    auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(program_end - program_start);
+    std::cout << "Total CIFAR-10 function time: " << total_duration.count() << " ms\n";
+    std::cout << "CIFAR-10 training finished." << std::endl;
+}
+
+} // namespace cifar_train

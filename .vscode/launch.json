@@ -1,0 +1,51 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        
+        {
+            "name": "CUDA Debug",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/sigmoid",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [
+                { "name": "CUDA_DEBUGGER_SOFTWARE_PREEMPTION", "value": "1" },
+                { "name": "CUDA_FORCE_PTX_JIT", "value": "1" },
+                { "name": "CUDA_ENABLE_BLOCKING_SYNC", "value": "1" }
+            ],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "/opt/cuda/bin/cuda-gdb",
+            "preLaunchTask": "make-debug",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Enable all CUDA debugging",
+                    "text": "set cuda memcheck on",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Enable line stepping",
+                    "text": "set cuda single_stepping_mode on",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Enable CUDA debugging",
+                    "text": "add-symbol-file /home/metarou/Dokumentumok/Programs/NN test/kernel.o",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set focus on specific kernel",
+                    "text": "break conv2d_compute_hidden_error_kernel",
+                    "ignoreFailures": true
+                }
+            ]
+        }
+    ]
+}

@@ -1,0 +1,31 @@
+{
+    "configurations": [
+        {
+            "name": "linux-gcc-x64",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/include",
+                "${workspaceFolder}/include/core",
+                "${workspaceFolder}/src",
+                "${workspaceFolder}/src/cuda",
+                "/opt/cuda/include",
+                "/usr/include/opencv4"
+            ],
+            "compilerPath": "/sbin/gcc",
+            "cStandard": "${default}",
+            "cppStandard": "${default}",
+            "intelliSenseMode": "linux-gcc-x64",
+            "compilerArgs": [
+                ""
+            ],
+            "defines": [
+                "\"defines\": [",
+                "    \"__CUDACC__\",",
+                "    \"__CUDA_ARCH__=120\",",
+                "    \"__NVCC__\"",
+                "]"
+            ]
+        }
+    ],
+    "version": 4
+}
